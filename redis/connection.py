@@ -31,6 +31,8 @@ from redis.exceptions import (
     ReadOnlyError
 )
 from redis.utils import HIREDIS_AVAILABLE
+HIREDIS_SUPPORTS_CALLABLE_ERRORS = False
+
 if HIREDIS_AVAILABLE:
     import hiredis
 

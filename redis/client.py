@@ -11,6 +11,7 @@ from redis._compat import (b, basestring, bytes, imap, iteritems, iterkeys,
                            safe_unicode)
 from redis.connection import (ConnectionPool, UnixDomainSocketConnection,
                               SSLConnection, Token)
+from redis.async_connection import AsyncConnection, AsyncSSLConnection
 from redis.lock import Lock, LuaLock
 from redis.exceptions import (
     ConnectionError,
@@ -399,7 +400,8 @@ class StrictRedis(object):
                  charset=None, errors=None,
                  decode_responses=False, retry_on_timeout=False,
                  ssl=False, ssl_keyfile=None, ssl_certfile=None,
-                 ssl_cert_reqs=None, ssl_ca_certs=None):
+                 ssl_cert_reqs=None, ssl_ca_certs=None,
+                 async=False):
         if not connection_pool:
             if charset is not None:
                 warnings.warn(DeprecationWarning(
@@ -437,12 +439,19 @@ class StrictRedis(object):
 
                 if ssl:
                     kwargs.update({
-                        'connection_class': SSLConnection,
                         'ssl_keyfile': ssl_keyfile,
                         'ssl_certfile': ssl_certfile,
                         'ssl_cert_reqs': ssl_cert_reqs,
                         'ssl_ca_certs': ssl_ca_certs,
                     })
+
+                    if async:
+                        kwargs['connection_class'] = AsyncSSLConnection
+                    else:
+                        kwargs['connection_class'] = SSLConnection
+                elif async:
+                    kwargs['connection_class'] = AsyncConnection
+
             connection_pool = ConnectionPool(**kwargs)
         self.connection_pool = connection_pool
         self._use_lua_lock = None

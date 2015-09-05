@@ -1,11 +1,28 @@
 from contextlib import contextmanager
 
+try:
+    import ssl
+    SSL_AVAILABLE = True
+except ImportError:
+    SSL_AVAILABLE = False
 
 try:
     import hiredis
     HIREDIS_AVAILABLE = True
 except ImportError:
     HIREDIS_AVAILABLE = False
+
+try:
+    import tornado
+    TORNADO_AVAILABLE = True
+except ImportError:
+    TORNADO_AVAILABLE = False
+
+try:
+    import greenlet
+    GREENLET_AVAILABLE = True
+except:
+    GREENLET_AVAILABLE = False
 
 
 def from_url(url, db=None, **kwargs):

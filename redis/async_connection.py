@@ -72,16 +72,17 @@ class AsyncHiredisParser(HiredisParser):
                 self._iostream.read_until(SYM_CRLF,
                                           greenlet.getcurrent().switch)
                 data = greenlet.getcurrent().parent.switch()
-                if data is None or len(data) == 0:
+                # an empty string indicates the server shutdown the socket
+                if not isinstance(data, bytes) or len(data) == 0:
                     raise socket.error(SERVER_CLOSED_CONNECTION_ERROR)
-                self._reader.feed(data)
-                response = self._reader.gets()
             except socket.timeout:
                 raise TimeoutError("Timeout reading from socket")
             except socket.error:
                 e = sys.exc_info()[1]
                 raise ConnectionError("Error while reading from socket: %s" %
                                       (e.args,))
+            self._reader.feed(data)
+            response = self._reader.gets()
         # if an older version of hiredis is installed, we need to attempt
         # to convert ResponseErrors to their appropriate types.
         if not HIREDIS_SUPPORTS_CALLABLE_ERRORS:
@@ -197,9 +198,13 @@ class AsyncConnection(Connection):
         try:
             if isinstance(command, str):
                 command = [command]
-            for item in command:
-                self._iostream.write(item,
-                                     callback=greenlet.getcurrent().switch)
+            ncmds = len(command)
+            for i, item in enumerate(command):
+                if i == (ncmds-1):
+                    cb = greenlet.getcurrent().switch
+                else:
+                    cb = None
+                self._iostream.write(item, callback=cb)
             greenlet.getcurrent().parent.switch()
         except socket.timeout:
             self.disconnect()

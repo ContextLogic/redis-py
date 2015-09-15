@@ -69,8 +69,9 @@ class AsyncHiredisParser(HiredisParser):
         response = self._reader.gets()
         while response is False:
             try:
-                self._iostream.read_until(SYM_CRLF,
-                                          greenlet.getcurrent().switch)
+                self._iostream.read_bytes(self.socket_read_size,
+                                          greenlet.getcurrent().switch,
+                                          partial=True)
                 data = greenlet.getcurrent().parent.switch()
                 # an empty string indicates the server shutdown the socket
                 if not isinstance(data, bytes) or len(data) == 0:

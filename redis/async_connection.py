@@ -83,6 +83,8 @@ class AsyncHiredisParser(HiredisParser):
                 raise ConnectionError("Error while reading from socket: %s" %
                                       (e.args,))
             self._reader.feed(data)
+            if not data.endswith(SYM_CRLF):
+                continue
             response = self._reader.gets()
         # if an older version of hiredis is installed, we need to attempt
         # to convert ResponseErrors to their appropriate types.

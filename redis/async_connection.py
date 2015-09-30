@@ -10,7 +10,6 @@ from redis.connection import (
     HiredisParser,
     HIREDIS_SUPPORTS_CALLABLE_ERRORS,
     SERVER_CLOSED_CONNECTION_ERROR,
-    SYM_CRLF,
 )
 
 from redis.exceptions import (
@@ -55,6 +54,8 @@ class AsyncHiredisParser(HiredisParser):
 
     def on_connect(self, connection):
         self._iostream = connection._iostream
+        self._read_timeout = connection.socket_connect_timeout
+
         super(AsyncHiredisParser, self).on_connect(connection)
 
     def read_response(self):
@@ -67,25 +68,54 @@ class AsyncHiredisParser(HiredisParser):
             self._next_response = False
             return response
 
+        timeout_handle = None
+        current_greenlet = greenlet.getcurrent()
+
+        def handle_read_timeout():
+            self._iostream.set_close_callback(None)
+            self._iostream._read_callback = None
+
+            current_greenlet.switch('timeout', None)
+
+        def handle_read_error():
+            """ Connection error, stream is closed """
+            if timeout_handle:
+                IOLoop.instance().remove_timeout(timeout_handle)
+
+            current_greenlet.switch('error', None)
+
+        def handle_read_complete(data):
+            self._iostream.set_close_callback(None)
+
+            if timeout_handle:
+                IOLoop.instance().remove_timeout(timeout_handle)
+            current_greenlet.switch('success', data)
+
         response = self._reader.gets()
         while response is False:
             try:
+                if self._read_timeout:
+                    ioloop = IOLoop.instance()
+                    timedelta = datetime.timedelta(seconds=self._read_timeout)
+                    timeout_handle = ioloop.add_timeout(timedelta,
+                                                        handle_read_timeout)
+                self._iostream.set_close_callback(handle_read_error)
                 self._iostream.read_bytes(self.socket_read_size,
-                                          greenlet.getcurrent().switch,
+                                          handle_read_complete,
                                           partial=True)
-                data = greenlet.getcurrent().parent.switch()
+                status, data = greenlet.getcurrent().parent.switch()
+                if status is 'timeout':
+                    raise TimeoutError("Timeout reading from socket")
+                if status is 'error':
+                    raise ConnectionError("Timeout reading from socket")
                 # an empty string indicates the server shutdown the socket
                 if not isinstance(data, bytes) or len(data) == 0:
                     raise socket.error(SERVER_CLOSED_CONNECTION_ERROR)
-            except socket.timeout:
-                raise TimeoutError("Timeout reading from socket")
             except socket.error:
                 e = sys.exc_info()[1]
                 raise ConnectionError("Error while reading from socket: %s" %
                                       (e.args,))
             self._reader.feed(data)
-            if not data.endswith(SYM_CRLF):
-                continue
             response = self._reader.gets()
         # if an older version of hiredis is installed, we need to attempt
         # to convert ResponseErrors to their appropriate types.
@@ -142,9 +172,10 @@ class AsyncConnection(Connection):
 
         timeout_handle = None
         current_greenlet = greenlet.getcurrent()
+        iostream = None
 
         def handle_timeout():
-            self._iostream.set_close_callback(None)
+            iostream.set_close_callback(None)
             current_greenlet.switch('timeout')
 
         def handle_error():
@@ -154,7 +185,7 @@ class AsyncConnection(Connection):
             current_greenlet.switch('error')
 
         def handle_connected():
-            self._iostream.set_close_callback(None)
+            iostream.set_close_callback(None)
             if timeout_handle:
                 IOLoop.instance().remove_timeout(timeout_handle)
             current_greenlet.switch('success')
@@ -174,7 +205,7 @@ class AsyncConnection(Connection):
                     for k, v in iteritems(self.socket_keepalive_options):
                         sock.setsockopt(socket.SOL_TCP, k, v)
 
-                self._iostream = self._wrap_socket(sock)
+                iostream = self._wrap_socket(sock)
 
                 timeout = self.socket_connect_timeout
                 if timeout:
@@ -182,9 +213,8 @@ class AsyncConnection(Connection):
                     timedelta = datetime.timedelta(seconds=timeout)
                     timeout_handle = ioloop.add_timeout(timedelta,
                                                         handle_timeout)
-                self._iostream.set_close_callback(handle_error)
-                self._iostream.connect(socket_address,
-                                       callback=handle_connected)
+                iostream.set_close_callback(handle_error)
+                iostream.connect(socket_address, callback=handle_connected)
 
                 # yield back to parent, wait for connect, error or timeout
                 status = greenlet.getcurrent().parent.switch()
@@ -193,16 +223,15 @@ class AsyncConnection(Connection):
                 if status is 'timeout':
                     raise ConnectionError('Connection timed out')
 
-                # set the socket_timeout now that we're connected
-                sock.settimeout(timeout)
+                self._iostream = iostream
                 return sock
             except ConnectionError as _:
                 err = _
                 if sock is not None:
                     sock.close()
-                if self._iostream is not None:
-                    self._iostream.close()
-                    self._iostream = None
+                if iostream is not None:
+                    iostream.close()
+                    iostream = None
 
         if err is not None:
             raise err

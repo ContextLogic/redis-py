@@ -1,6 +1,7 @@
 from __future__ import with_statement
 from select import select
 from redis._compat import iteritems
+import datetime
 import socket
 import sys
 
@@ -138,11 +139,30 @@ class AsyncConnection(Connection):
             return
 
         err = None
+
+        timeout_handle = None
+        current_greenlet = greenlet.getcurrent()
+
+        def handle_timeout():
+            self._iostream.set_close_callback(None)
+            current_greenlet.switch('timeout')
+
+        def handle_error():
+            """ Connection error, stream is closed """
+            if timeout_handle:
+                IOLoop.instance().remove_timeout(timeout_handle)
+            current_greenlet.switch('error')
+
+        def handle_connected():
+            self._iostream.set_close_callback(None)
+            if timeout_handle:
+                IOLoop.instance().remove_timeout(timeout_handle)
+            current_greenlet.switch('success')
+
         for res in socket.getaddrinfo(self.host, self.port, 0,
                                       socket.SOCK_STREAM):
             family, socktype, proto, canonname, socket_address = res
             sock = None
-            iostream = None
             try:
                 sock = socket.socket(family, socktype, proto)
                 # TCP_NODELAY
@@ -154,26 +174,35 @@ class AsyncConnection(Connection):
                     for k, v in iteritems(self.socket_keepalive_options):
                         sock.setsockopt(socket.SOL_TCP, k, v)
 
-                # set the socket_connect_timeout before we connect
-                sock.settimeout(self.socket_connect_timeout)
+                self._iostream = self._wrap_socket(sock)
 
-                iostream = self._wrap_socket(sock)
-                iostream.connect(socket_address,
-                                 callback=greenlet.getcurrent().switch)
-                # yield back to parent, wait for connect
-                greenlet.getcurrent().parent.switch()
+                timeout = self.socket_connect_timeout
+                if timeout:
+                    ioloop = IOLoop.instance()
+                    timedelta = datetime.timedelta(seconds=timeout)
+                    timeout_handle = ioloop.add_timeout(timedelta,
+                                                        handle_timeout)
+                self._iostream.set_close_callback(handle_error)
+                self._iostream.connect(socket_address,
+                                       callback=handle_connected)
+
+                # yield back to parent, wait for connect, error or timeout
+                status = greenlet.getcurrent().parent.switch()
+                if status is 'error':
+                    raise ConnectionError('Error connecting to host')
+                if status is 'timeout':
+                    raise ConnectionError('Connection timed out')
 
                 # set the socket_timeout now that we're connected
-                sock.settimeout(self.socket_timeout)
-
-                self._iostream = iostream
+                sock.settimeout(timeout)
                 return sock
-            except socket.error as _:
+            except ConnectionError as _:
                 err = _
                 if sock is not None:
                     sock.close()
-                if iostream is not None:
-                    iostream.close()
+                if self._iostream is not None:
+                    self._iostream.close()
+                    self._iostream = None
 
         if err is not None:
             raise err

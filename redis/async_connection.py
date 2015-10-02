@@ -245,10 +245,11 @@ class AsyncConnection(Connection):
 
     def disconnect(self):
         "Disconnects from the Redis server"
-        super(AsyncConnection, self).disconnect()
-
         if self._iostream is None:
             return
+
+        super(AsyncConnection, self).disconnect()
+
         try:
             self._iostream.close()
         except socket.error:

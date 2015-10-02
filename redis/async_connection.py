@@ -38,6 +38,7 @@ if SSL_AVAILABLE:
 class AsyncHiredisParser(HiredisParser):
     def __init__(self, socket_read_size):
         self._iostream = None
+        self._timeout_handle = None
 
         if not HIREDIS_AVAILABLE:
             raise("Async parser requires Hiredis")
@@ -49,7 +50,13 @@ class AsyncHiredisParser(HiredisParser):
         super(AsyncHiredisParser, self).__init__(socket_read_size)
 
     def on_disconnect(self):
-        self._iostream = None
+        if self._timeout_handle:
+            IOLoop.instance().remove_timeout(self._timeout_handle)
+            self._timeout_handle = None
+
+        self._iostream.set_close_callback(None)
+        self._iostream._read_callback = None
+
         super(AsyncHiredisParser, self).on_disconnect()
 
     def on_connect(self, connection):
@@ -68,7 +75,6 @@ class AsyncHiredisParser(HiredisParser):
             self._next_response = False
             return response
 
-        timeout_handle = None
         current_greenlet = greenlet.getcurrent()
 
         def handle_read_timeout():
@@ -79,16 +85,16 @@ class AsyncHiredisParser(HiredisParser):
 
         def handle_read_error():
             """ Connection error, stream is closed """
-            if timeout_handle:
-                IOLoop.instance().remove_timeout(timeout_handle)
+            if self._timeout_handle:
+                IOLoop.instance().remove_timeout(self._timeout_handle)
 
             current_greenlet.switch('error', None)
 
         def handle_read_complete(data):
             self._iostream.set_close_callback(None)
 
-            if timeout_handle:
-                IOLoop.instance().remove_timeout(timeout_handle)
+            if self._timeout_handle:
+                IOLoop.instance().remove_timeout(self._timeout_handle)
             current_greenlet.switch('success', data)
 
         response = self._reader.gets()
@@ -97,8 +103,8 @@ class AsyncHiredisParser(HiredisParser):
                 if self._read_timeout:
                     ioloop = IOLoop.instance()
                     timedelta = datetime.timedelta(seconds=self._read_timeout)
-                    timeout_handle = ioloop.add_timeout(timedelta,
-                                                        handle_read_timeout)
+                    self._timeout_handle = ioloop.add_timeout(timedelta,
+                                                    handle_read_timeout)
                 self._iostream.set_close_callback(handle_read_error)
                 self._iostream.read_bytes(self.socket_read_size,
                                           handle_read_complete,

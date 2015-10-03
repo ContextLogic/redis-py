@@ -37,6 +37,7 @@ if SSL_AVAILABLE:
 
 class AsyncHiredisParser(HiredisParser):
     def __init__(self, socket_read_size):
+        self._ioloop = None
         self._iostream = None
         self._timeout_handle = None
 
@@ -60,8 +61,9 @@ class AsyncHiredisParser(HiredisParser):
         super(AsyncHiredisParser, self).on_disconnect()
 
     def on_connect(self, connection):
+        self._ioloop = connection._ioloop
         self._iostream = connection._iostream
-        self._read_timeout = connection.socket_connect_timeout
+        self._read_timeout = connection.socket_timeout
 
         super(AsyncHiredisParser, self).on_connect(connection)
 
@@ -80,36 +82,33 @@ class AsyncHiredisParser(HiredisParser):
         def handle_read_timeout():
             self._iostream.set_close_callback(None)
             self._iostream._read_callback = None
-
             current_greenlet.switch('timeout', None)
 
         def handle_read_error():
+            self._iostream.set_close_callback(None)
             """ Connection error, stream is closed """
             if self._timeout_handle:
-                IOLoop.instance().remove_timeout(self._timeout_handle)
-
+                self._ioloop.remove_timeout(self._timeout_handle)
             current_greenlet.switch('error', None)
 
         def handle_read_complete(data):
             self._iostream.set_close_callback(None)
-
             if self._timeout_handle:
-                IOLoop.instance().remove_timeout(self._timeout_handle)
+                self._ioloop.remove_timeout(self._timeout_handle)
             current_greenlet.switch('success', data)
 
         response = self._reader.gets()
         while response is False:
             try:
                 if self._read_timeout:
-                    ioloop = IOLoop.instance()
                     timedelta = datetime.timedelta(seconds=self._read_timeout)
-                    self._timeout_handle = ioloop.add_timeout(timedelta,
-                                                    handle_read_timeout)
+                    self._timeout_handle = self._ioloop.add_timeout(timedelta,
+                        handle_read_timeout)
                 self._iostream.set_close_callback(handle_read_error)
                 self._iostream.read_bytes(self.socket_read_size,
                                           handle_read_complete,
                                           partial=True)
-                status, data = greenlet.getcurrent().parent.switch()
+                status, data = current_greenlet.parent.switch()
                 if status is 'timeout':
                     raise TimeoutError("Timeout reading from socket")
                 if status is 'error':
@@ -142,7 +141,7 @@ class AsyncHiredisParser(HiredisParser):
         return response
 
 
-class ConnectionInvalidContext(Exception):
+class ConnectionInvalidContext(RedisError):
     pass
 
 
@@ -151,10 +150,14 @@ class AsyncConnection(Connection):
     description_format = ("AsyncConnection"
                           "<host=%(host)s,port=%(port)s,db=%(db)s>")
 
-    def __init__(self, parser_class=AsyncHiredisParser, *args, **kwargs):
-        self._iostream = None
+    def __init__(self, parser_class=AsyncHiredisParser,
+                 ioloop = None, *args, **kwargs):
         super(AsyncConnection, self).__init__(parser_class=parser_class,
                                               *args, **kwargs)
+        self._ioloop = ioloop or IOLoop.instance()
+        self._iostream = None
+        self._timeout_handle = None
+        # TODO: raise an error if not socket_timeout and socket_connect_timeout
 
     def _wrap_socket(self, sock):
         return IOStream(sock)
@@ -182,18 +185,19 @@ class AsyncConnection(Connection):
 
         def handle_timeout():
             iostream.set_close_callback(None)
+            iostream._connect_callback = None
             current_greenlet.switch('timeout')
 
         def handle_error():
             """ Connection error, stream is closed """
             if timeout_handle:
-                IOLoop.instance().remove_timeout(timeout_handle)
+                self._ioloop.remove_timeout(timeout_handle)
             current_greenlet.switch('error')
 
         def handle_connected():
             iostream.set_close_callback(None)
             if timeout_handle:
-                IOLoop.instance().remove_timeout(timeout_handle)
+                self._ioloop.remove_timeout(timeout_handle)
             current_greenlet.switch('success')
 
         for res in socket.getaddrinfo(self.host, self.port, 0,
@@ -215,18 +219,17 @@ class AsyncConnection(Connection):
 
                 timeout = self.socket_connect_timeout
                 if timeout:
-                    ioloop = IOLoop.instance()
                     timedelta = datetime.timedelta(seconds=timeout)
-                    timeout_handle = ioloop.add_timeout(timedelta,
+                    timeout_handle = self._ioloop.add_timeout(timedelta,
                                                         handle_timeout)
                 iostream.set_close_callback(handle_error)
                 iostream.connect(socket_address, callback=handle_connected)
 
                 # yield back to parent, wait for connect, error or timeout
-                status = greenlet.getcurrent().parent.switch()
-                if status is 'error':
+                status = current_greenlet.parent.switch()
+                if status == 'error':
                     raise ConnectionError('Error connecting to host')
-                if status is 'timeout':
+                if status == 'timeout':
                     raise ConnectionError('Connection timed out')
 
                 self._iostream = iostream
@@ -248,6 +251,12 @@ class AsyncConnection(Connection):
         if self._iostream is None:
             return
 
+        # cleanup possible write callbacks
+        self._iostream.set_close_callback(None)
+        self._iostream._write_callback = None
+        if self._timeout_handle:
+            IOLoop.instance().remove_timeout(self._timeout_handle)
+
         super(AsyncConnection, self).disconnect()
 
         try:
@@ -263,29 +272,47 @@ class AsyncConnection(Connection):
 
         if not self._iostream:
             self.connect()
+
+        current_greenlet = greenlet.getcurrent()
+        timeout_handle = None
+
+        def handle_write_timeout():
+            self._iostream.set_close_callback(None)
+            self._iostream._write_callback = None
+            current_greenlet.switch('timeout')
+
+        def handle_write_error():
+            """ Connection error, stream is closed """
+            if timeout_handle:
+                self._ioloop.remove_timeout(timeout_handle)
+            current_greenlet.switch('error')
+
+        def handle_write_complete():
+            self._iostream.set_close_callback(None)
+            if self._timeout_handle:
+                self._ioloop.remove_timeout(self._timeout_handle)
+            current_greenlet.switch('success')
+
         try:
             if isinstance(command, str):
                 command = [command]
             ncmds = len(command)
             for i, item in enumerate(command):
                 if i == (ncmds-1):
-                    cb = greenlet.getcurrent().switch
+                    cb = handle_write_complete
                 else:
                     cb = None
                 self._iostream.write(item, callback=cb)
-            greenlet.getcurrent().parent.switch()
-        except socket.timeout:
-            self.disconnect()
-            raise TimeoutError("Timeout writing to socket")
-        except socket.error:
-            e = sys.exc_info()[1]
-            self.disconnect()
-            if len(e.args) == 1:
-                _errno, errmsg = 'UNKNOWN', e.args[0]
-            else:
-                _errno, errmsg = e.args
-            raise ConnectionError("Error %s while writing to socket. %s." %
-                                  (_errno, errmsg))
+
+            self._iostream.set_close_callback(handle_write_error)
+            timedelta = datetime.timedelta(seconds=self.socket_timeout)
+            self._timeout_handle = self._ioloop.add_timeout(timedelta,
+                                                      handle_write_timeout)
+            status = greenlet.getcurrent().parent.switch()
+            if status == 'timeout':
+                raise TimeoutError("Timeout writing to socket")
+            if status == 'error':
+                raise ConnectionError("Socket error during write")
         except:
             self.disconnect()
             raise

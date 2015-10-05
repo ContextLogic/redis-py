@@ -56,7 +56,8 @@ class AsyncHiredisParser(HiredisParser):
             self._timeout_handle = None
 
         self._iostream.set_close_callback(None)
-        self._iostream._read_callback = None
+        if self._iostream._read_callback:
+            self._iostream._read_callback = None
 
         super(AsyncHiredisParser, self).on_disconnect()
 
@@ -85,7 +86,7 @@ class AsyncHiredisParser(HiredisParser):
             current_greenlet.switch('timeout', None)
 
         def handle_read_error():
-            self._iostream.set_close_callback(None)
+            self._iostream._read_callback = None
             """ Connection error, stream is closed """
             if self._timeout_handle:
                 self._ioloop.remove_timeout(self._timeout_handle)
@@ -189,6 +190,7 @@ class AsyncConnection(Connection):
             current_greenlet.switch('timeout')
 
         def handle_error():
+            iostream._connect_callback = None
             """ Connection error, stream is closed """
             if timeout_handle:
                 self._ioloop.remove_timeout(timeout_handle)
@@ -251,11 +253,11 @@ class AsyncConnection(Connection):
         if self._iostream is None:
             return
 
-        # cleanup possible write callbacks
         self._iostream.set_close_callback(None)
-        self._iostream._write_callback = None
+        if self._iostream._write_callback:
+            self._iostream._write_callback = None
         if self._timeout_handle:
-            IOLoop.instance().remove_timeout(self._timeout_handle)
+            self._ioloop.remove_timeout(self._timeout_handle)
 
         super(AsyncConnection, self).disconnect()
 
@@ -263,6 +265,7 @@ class AsyncConnection(Connection):
             self._iostream.close()
         except socket.error:
             pass
+
         self._iostream = None
 
     def send_packed_command(self, command):
@@ -274,7 +277,6 @@ class AsyncConnection(Connection):
             self.connect()
 
         current_greenlet = greenlet.getcurrent()
-        timeout_handle = None
 
         def handle_write_timeout():
             self._iostream.set_close_callback(None)
@@ -283,8 +285,9 @@ class AsyncConnection(Connection):
 
         def handle_write_error():
             """ Connection error, stream is closed """
-            if timeout_handle:
-                self._ioloop.remove_timeout(timeout_handle)
+            self._iostream._write_callback = None
+            if self._timeout_handle:
+                self._ioloop.remove_timeout(self._timeout_handle)
             current_greenlet.switch('error')
 
         def handle_write_complete():
@@ -300,15 +303,16 @@ class AsyncConnection(Connection):
             for i, item in enumerate(command):
                 if i == (ncmds-1):
                     cb = handle_write_complete
+                    self._iostream.set_close_callback(handle_write_error)
+                    timedelta = datetime.timedelta(seconds=self.socket_timeout)
+                    self._timeout_handle = self._ioloop.add_timeout(timedelta,
+                                                      handle_write_timeout)
                 else:
                     cb = None
+
                 self._iostream.write(item, callback=cb)
 
-            self._iostream.set_close_callback(handle_write_error)
-            timedelta = datetime.timedelta(seconds=self.socket_timeout)
-            self._timeout_handle = self._ioloop.add_timeout(timedelta,
-                                                      handle_write_timeout)
-            status = greenlet.getcurrent().parent.switch()
+            status = current_greenlet.parent.switch()
             if status == 'timeout':
                 raise TimeoutError("Timeout writing to socket")
             if status == 'error':
@@ -332,7 +336,7 @@ class AsyncConnection(Connection):
         if timeout is 0:
             return check_for_data()
         else:
-            IOLoop.current().call_later(timeout, greenlet.getcurrent().switch)
+            self._ioloop.call_later(timeout, greenlet.getcurrent().switch)
             greenlet.getcurrent().parent.switch()
             return check_for_data()
 
